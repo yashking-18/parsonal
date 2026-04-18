@@ -39,12 +39,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
-          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}   # ✅ ADDED (IMPORTANT)
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
         run: |
           echo "🚀 Ultra bot starting..."
-
-          while true; do
-            python bot.py || echo "❌ Crash detected"
-            echo "🔁 Restarting in 3 sec..."
-            sleep 3
-          done
+          python bot.py
