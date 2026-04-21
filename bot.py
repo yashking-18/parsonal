@@ -10,24 +10,115 @@ import requests
 from datetime import datetime
 from collections import deque
 import queue
+from concurrent.futures import ThreadPoolExecutor
+import gc
+from requests.adapters import HTTPAdapter
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
+# ========== SESSION WITH CONNECTION POOL ==========
+session = requests.Session()
+session.mount('https://', HTTPAdapter(pool_connections=50, pool_maxsize=50))
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+bot.session = session
 
 # ========== GLOBAL VARIABLES ==========
 reply_mode = {}
 live_monitor = False
 message_queue = queue.Queue()
 queue_thread_running = True
-seen_users = set()  # Track users who already started
+seen_users = set()
 
-# ========== QUEUE PROCESSOR (HAR MESSAGE KO DELAY KE SAATH BHEJEGA) ==========
+# ========== CACHE SYSTEM ==========
+user_cache = {}
+cache_lock = threading.Lock()
+
+def get_cached_user(user_id):
+    with cache_lock:
+        if user_id in user_cache:
+            return user_cache[user_id]
+    return None
+
+def set_cached_user(user_id, data):
+    with cache_lock:
+        user_cache[user_id] = data
+        if len(user_cache) > 1000:
+            for uid in list(user_cache.keys())[:200]:
+                del user_cache[uid]
+
+# ========== BATCH SYSTEM ==========
+message_batch = []
+batch_lock = threading.Lock()
+BATCH_SIZE = 10
+
+def send_batch():
+    with batch_lock:
+        if not message_batch:
+            return
+        batch_copy = message_batch.copy()
+        message_batch.clear()
+    
+    for chat_id, text, parse_mode in batch_copy:
+        try:
+            bot.send_message(chat_id, text, parse_mode=parse_mode)
+        except:
+            pass
+
+def batch_sender_loop():
+    while True:
+        time.sleep(0.5)
+        send_batch()
+
+threading.Thread(target=batch_sender_loop, daemon=True).start()
+
+# ========== THREAD POOLS ==========
+user_executor = ThreadPoolExecutor(max_workers=14)
+admin_executor = ThreadPoolExecutor(max_workers=1)
+
+# ========== LOG DELAY SYSTEM (1 MINUTE DELAY FOR CHANNEL) ==========
+delayed_logs = []
+delayed_log_lock = threading.Lock()
+
+def delayed_channel_logger():
+    """Background thread jo 1 minute delay se channel log bhejega"""
+    while True:
+        try:
+            current_time = time.time()
+            
+            to_send = []
+            with delayed_log_lock:
+                for i, (timestamp, log_data) in enumerate(delayed_logs[:]):
+                    if current_time - timestamp >= 60:  # 1 minute delay
+                        to_send.append(log_data)
+                        delayed_logs.remove((timestamp, log_data))
+            
+            for log_data in to_send:
+                try:
+                    if log_data['type'] == 'text':
+                        bot.send_message(CHANNEL_ID, log_data['text'], parse_mode='HTML')
+                    else:
+                        bot.copy_message(CHANNEL_ID, log_data['chat_id'], log_data['message_id'])
+                        if log_data.get('caption'):
+                            bot.send_message(CHANNEL_ID, log_data['caption'], parse_mode='HTML')
+                except Exception as e:
+                    print(f"Delayed log error: {e}")
+            
+            time.sleep(1)
+        except:
+            time.sleep(1)
+
+threading.Thread(target=delayed_channel_logger, daemon=True).start()
+
+def add_channel_log_with_delay(log_data):
+    """Channel log ko 1 minute delay se bhejega"""
+    with delayed_log_lock:
+        delayed_logs.append((time.time(), log_data))
+
+# ========== QUEUE PROCESSOR ==========
 def process_queue():
-    """Background thread jo queue se message nikalta hai aur bhejta hai"""
     while queue_thread_running:
         try:
             task = message_queue.get(timeout=1)
@@ -49,35 +140,18 @@ def process_queue():
                     if task.get('caption'):
                         bot.send_message(ADMIN_ID, task['caption'], reply_markup=task.get('reply_markup'))
             
-            elif msg_type == 'log_to_channel':
-                if task['content_type'] == 'text':
-                    bot.send_message(CHANNEL_ID, task['text'], parse_mode='HTML')
-                else:
-                    bot.copy_message(CHANNEL_ID, task['chat_id'], task['message_id'])
-                    if task.get('caption'):
-                        bot.send_message(CHANNEL_ID, task['caption'])
-            
-            elif msg_type == 'ack_to_user':
-                try:
-                    bot.edit_message_text(
-                        task['text'], 
-                        task['chat_id'], 
-                        task['message_id'],
-                        parse_mode='HTML'
-                    )
-                except:
-                    pass
-            
             elif msg_type == 'admin_reply':
                 bot.send_message(task['user_id'], task['text'], parse_mode='HTML')
                 if task.get('channel_log'):
-                    bot.send_message(CHANNEL_ID, task['channel_log'], parse_mode='HTML')
+                    add_channel_log_with_delay({
+                        'type': 'text',
+                        'text': task['channel_log']
+                    })
             
             elif msg_type == 'confirm_to_admin':
                 bot.send_message(ADMIN_ID, task['text'], parse_mode='HTML')
             
             elif msg_type == 'new_user_alert':
-                # Send photo if available
                 if task.get('photo'):
                     try:
                         bot.send_photo(
@@ -91,29 +165,30 @@ def process_queue():
                 else:
                     bot.send_message(ADMIN_ID, task['text'], parse_mode='HTML')
                 
-                # Also log to channel
                 if task.get('channel_log'):
-                    if task.get('photo'):
-                        try:
-                            bot.send_photo(
-                                CHANNEL_ID,
-                                task['photo'],
-                                caption=task['channel_log'],
-                                parse_mode='HTML'
-                            )
-                        except:
-                            bot.send_message(CHANNEL_ID, task['channel_log'], parse_mode='HTML')
-                    else:
-                        bot.send_message(CHANNEL_ID, task['channel_log'], parse_mode='HTML')
+                    add_channel_log_with_delay({
+                        'type': 'text',
+                        'text': task['channel_log']
+                    })
             
-            time.sleep(0.3)
+            elif msg_type == 'ack_to_user':
+                try:
+                    bot.edit_message_text(
+                        task['text'], 
+                        task['chat_id'], 
+                        task['message_id'],
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+            
+            time.sleep(0.1)
             
         except queue.Empty:
             continue
         except Exception as e:
             send_error(f"Queue Error: {traceback.format_exc()}")
 
-# Start queue processor thread
 threading.Thread(target=process_queue, daemon=True).start()
 
 # ========== ERROR HANDLER ==========
@@ -146,7 +221,6 @@ threading.Thread(target=auto_alert, daemon=True).start()
 
 # ========== GET USER PROFILE PHOTO ==========
 def get_user_profile_photo(user_id):
-    """Get user's profile photo file_id"""
     try:
         photos = bot.get_user_profile_photos(user_id, limit=1)
         if photos.total_count > 0:
@@ -157,7 +231,10 @@ def get_user_profile_photo(user_id):
 
 # ========== GET USER DETAILS ==========
 def get_user_full_details(user):
-    """Get complete user details"""
+    cached = get_cached_user(user.id)
+    if cached:
+        return cached
+    
     details = {
         'first_name': user.first_name or "N/A",
         'last_name': user.last_name or "N/A",
@@ -167,6 +244,7 @@ def get_user_full_details(user):
         'is_premium': getattr(user, 'is_premium', False),
         'is_bot': user.is_bot if hasattr(user, 'is_bot') else False
     }
+    set_cached_user(user.id, details)
     return details
 
 # ========== HELPERS ==========
@@ -186,17 +264,14 @@ def admin_keyboard():
     kb.add(KeyboardButton("📊 STATS"))
     return kb
 
-# ========== START COMMAND (WITH NEW USER DETECTION) ==========
+# ========== START COMMAND ==========
 @bot.message_handler(commands=['start'])
 def start(m):
     try:
         user = m.from_user
         user_id = user.id
-        
-        # Check if new user
         is_new_user = user_id not in seen_users
         
-        # Loading animation
         msg = bot.send_message(m.chat.id, "⚡ Initializing system...")
         time.sleep(0.5)
         bot.edit_message_text("🚀 Loading modules...", m.chat.id, msg.message_id)
@@ -212,7 +287,6 @@ def start(m):
             "🧠 Smart AI Routing Enabled"
         ]
         
-        # Welcome message for user
         bot.edit_message_text(f"""
 <b>╔═══〔 🚀 ULTRA SUPPORT CORE 🚀 〕═══╗</b>
 
@@ -236,24 +310,13 @@ def start(m):
 <b>╚════════════════════════════╝</b>
 """, m.chat.id, msg.message_id)
         
-        # ===== NEW USER ALERT TO ADMIN (WITH DP) =====
         if is_new_user:
             seen_users.add(user_id)
-            
-            # Get user details
             details = get_user_full_details(user)
             profile_photo = get_user_profile_photo(user_id)
-            
-            # Premium badge
             premium_badge = "✅ Yes" if details['is_premium'] else "❌ No"
-            
-            # User link
             user_link = f"tg://user?id={user_id}"
             
-            # Format date (account creation approx)
-            current_year = datetime.now().year
-            
-            # Admin alert message
             admin_alert = f"""
 ╔═══〔 🆕 NEW USER DETECTED 🆕 〕═══╗
 
@@ -278,7 +341,6 @@ def start(m):
 ╚════════════════════════════╝
 """
             
-            # Channel log
             channel_log = f"""
 💀📡 ╔═══〔 🆕 NEW USER JOINED 🆕 〕═══╗ 📡💀
 
@@ -294,7 +356,6 @@ def start(m):
 💀📡 ╚════════════════════════════╝ 📡💀
 """
             
-            # Queue new user alert with photo
             message_queue.put({
                 'type': 'new_user_alert',
                 'photo': profile_photo,
@@ -302,7 +363,6 @@ def start(m):
                 'channel_log': channel_log
             })
         
-        # Admin panel if admin
         if m.chat.id == ADMIN_ID:
             bot.send_message(ADMIN_ID, "⚙️ Admin Panel Ready", reply_markup=admin_keyboard())
             
@@ -319,6 +379,11 @@ def show_stats(m):
 👥 <b>Total Users:</b> {len(seen_users)}
 📦 <b>Queue Size:</b> {message_queue.qsize()}
 ⚡ <b>Status:</b> 🟢 Active
+🧵 <b>Threads:</b> 14 User + 1 Admin
+💾 <b>RAM Usage:</b> {psutil.virtual_memory().percent}%
+🚀 <b>Batch Size:</b> {BATCH_SIZE}
+💿 <b>Cache Size:</b> {len(user_cache)} users
+⏰ <b>Channel Log Delay:</b> 1 Minute
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 💀 <b>ULTRA ACK BOT</b> 🔥
@@ -328,7 +393,7 @@ def show_stats(m):
     except:
         send_error(traceback.format_exc())
 
-# ========== USER MESSAGE HANDLER (FAST FORWARD - NO LIMIT) ==========
+# ========== USER MESSAGE HANDLER ==========
 @bot.message_handler(func=lambda m: m.chat.id != ADMIN_ID,
 content_types=['text','photo','video','document','audio','voice','sticker'])
 def forward(m):
@@ -336,20 +401,17 @@ def forward(m):
         uid = m.from_user.id
         uname = m.from_user.username or "NoUsername"
         
-        # Add to seen users if not already
         if uid not in seen_users:
             seen_users.add(uid)
         
-        # Reply button for admin
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("💬 REPLY", callback_data=f"reply_{uid}"))
         
-        # Format user info
         user_info = f"👤 Username: @{uname}\n🆔 ID: <code>{uid}</code>"
         
-        # ===== QUEUE: FORWARD TO ADMIN =====
-        if m.content_type == "text":
-            admin_text = f"""
+        def send_to_admin():
+            if m.content_type == "text":
+                admin_text = f"""
 <b>╔═══〔 📡💬 LIVE MESSAGE STREAM 💬📡 〕═══╗</b>
 
 {user_info}
@@ -358,25 +420,25 @@ def forward(m):
 
 <b>╚════════════════════════════╝</b>
 """
-            message_queue.put({
-                'type': 'forward_to_admin',
-                'content_type': 'text',
-                'text': admin_text,
-                'reply_markup': kb,
-                'chat_id': m.chat.id,
-                'message_id': m.message_id
-            })
-        else:
-            message_queue.put({
-                'type': 'forward_to_admin',
-                'content_type': 'media',
-                'chat_id': m.chat.id,
-                'message_id': m.message_id,
-                'caption': user_info,
-                'reply_markup': kb
-            })
+                message_queue.put({
+                    'type': 'forward_to_admin',
+                    'content_type': 'text',
+                    'text': admin_text,
+                    'reply_markup': kb,
+                    'chat_id': m.chat.id,
+                    'message_id': m.message_id
+                })
+            else:
+                message_queue.put({
+                    'type': 'forward_to_admin',
+                    'content_type': 'media',
+                    'chat_id': m.chat.id,
+                    'message_id': m.message_id,
+                    'caption': user_info,
+                    'reply_markup': kb
+                })
         
-        # ===== QUEUE: LOG TO CHANNEL =====
+        # Channel log with 1 MINUTE DELAY
         if m.content_type == "text":
             channel_text = f"""
 💀📡 ╔═══〔 📡💬 CHANNEL LOG 💬📡 〕═══╗ 📡💀
@@ -388,21 +450,18 @@ def forward(m):
 
 💀📡 ╚════════════════════════════╝ 📡💀
 """
-            message_queue.put({
-                'type': 'log_to_channel',
-                'content_type': 'text',
+            add_channel_log_with_delay({
+                'type': 'text',
                 'text': channel_text
             })
         else:
-            message_queue.put({
-                'type': 'log_to_channel',
-                'content_type': 'media',
+            add_channel_log_with_delay({
+                'type': 'media',
                 'chat_id': m.chat.id,
                 'message_id': m.message_id,
-                'caption': f"👤 @{uname}\n🆔 {uid}\n📎 Media received"
+                'caption': f"👤 @{uname}\n🆔 {uid}\n📎 Media received (1 min delay)"
             })
         
-        # ===== QUEUE: ACKNOWLEDGEMENT TO USER (LOADING ANIMATION) =====
         sent = bot.send_message(m.chat.id, "⚡ Initiating Secure Transmission...")
         
         steps = [
@@ -418,19 +477,21 @@ def forward(m):
         ]
         
         for step in steps:
-            time.sleep(0.25)
+            time.sleep(0.1)
             try:
                 bot.edit_message_text(step, m.chat.id, sent.message_id)
             except:
                 pass
         
-        # Final acknowledgement
+        user_executor.submit(send_to_admin)
+        
         final_msg = """
 <b>╔═══〔 💀⚡ TRANSMISSION COMPLETE ⚡💀 〕═══╗</b>
 
 📡 Delivered Successfully  
 🚀 Ultra Speed  
 🧠 System Active  
+⏰ Channel log will appear in 1 minute
 
 <b>╚════════════════════════════╝</b>
 """
@@ -476,26 +537,25 @@ def reply_btn(c):
 # ========== ADMIN REPLY HANDLER ==========
 @bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID and m.text not in ["📊 SPEED", "⛔ STOP", "/cancel", "📊 STATS"])
 def admin_reply(m):
-    try:
-        if ADMIN_ID not in reply_mode:
-            bot.send_message(ADMIN_ID, "❌ Pehle '💬 REPLY' button dabayein!")
-            return
-        
-        if not reply_mode[ADMIN_ID]["locked"]:
-            bot.send_message(ADMIN_ID, "❌ Lock expired, please click REPLY again")
-            return
-        
-        uid = reply_mode[ADMIN_ID]["target_id"]
-        uname = reply_mode[ADMIN_ID]["target_username"]
-        
-        # Show processing
-        processing = bot.send_message(ADMIN_ID, "⚡ Processing your reply...\n🔄 Encrypting...")
-        time.sleep(0.5)
-        bot.edit_message_text("📡 Sending to user...", ADMIN_ID, processing.message_id)
-        time.sleep(0.5)
-        
-        # Message to user
-        user_msg = f"""
+    def process_admin_reply():
+        try:
+            if ADMIN_ID not in reply_mode:
+                bot.send_message(ADMIN_ID, "❌ Pehle '💬 REPLY' button dabayein!")
+                return
+            
+            if not reply_mode[ADMIN_ID]["locked"]:
+                bot.send_message(ADMIN_ID, "❌ Lock expired, please click REPLY again")
+                return
+            
+            uid = reply_mode[ADMIN_ID]["target_id"]
+            uname = reply_mode[ADMIN_ID]["target_username"]
+            
+            processing = bot.send_message(ADMIN_ID, "⚡ Processing your reply...\n🔄 Encrypting...")
+            time.sleep(0.3)
+            bot.edit_message_text("📡 Sending to user...", ADMIN_ID, processing.message_id)
+            time.sleep(0.3)
+            
+            user_msg = f"""
 ╔═══〔 📩 SUPPORT TEAM REPLY 📩 〕═══╗
 
 {m.text}
@@ -506,9 +566,8 @@ def admin_reply(m):
 
 ╚════════════════════════════╝
 """
-        
-        # Channel log
-        channel_log = f"""
+            
+            channel_log = f"""
 💀📡 ╔═══〔 📡💬 ADMIN REPLY LOG 💬📡 〕═══╗ 📡💀
 
 👑 <b>Admin → 👤 User:</b> @{uname} (<code>{uid}</code>)
@@ -520,20 +579,19 @@ def admin_reply(m):
 
 ⏱️ <b>Sent at:</b> Just now
 ✅ <b>Status:</b> Delivered
+⏰ <b>Channel log in:</b> 1 minute
 
 💀📡 ╚════════════════════════════╝ 📡💀
 """
-        
-        # Queue admin reply
-        message_queue.put({
-            'type': 'admin_reply',
-            'user_id': uid,
-            'text': user_msg,
-            'channel_log': channel_log
-        })
-        
-        # Queue confirmation to admin
-        confirmation = f"""
+            
+            message_queue.put({
+                'type': 'admin_reply',
+                'user_id': uid,
+                'text': user_msg,
+                'channel_log': channel_log
+            })
+            
+            confirmation = f"""
 ╔═══〔 ✅ MESSAGE SENT SUCCESSFULLY ✅ 〕═══╗
 
 📤 <b>Your message:</b>
@@ -549,20 +607,19 @@ def admin_reply(m):
 
 ╚════════════════════════════╝
 """
-        message_queue.put({
-            'type': 'confirm_to_admin',
-            'text': confirmation
-        })
-        
-        # Remove lock
-        del reply_mode[ADMIN_ID]
-        
-        # Update processing message
-        bot.edit_message_text("✅ Message queued successfully!", ADMIN_ID, processing.message_id)
-        
-    except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Failed: {str(e)}")
-        send_error(traceback.format_exc())
+            message_queue.put({
+                'type': 'confirm_to_admin',
+                'text': confirmation
+            })
+            
+            del reply_mode[ADMIN_ID]
+            bot.edit_message_text("✅ Message queued successfully!", ADMIN_ID, processing.message_id)
+            
+        except Exception as e:
+            bot.send_message(ADMIN_ID, f"❌ Failed: {str(e)}")
+            send_error(traceback.format_exc())
+    
+    admin_executor.submit(process_admin_reply)
 
 # ========== CANCEL COMMAND ==========
 @bot.message_handler(func=lambda m: m.text == "/cancel" and m.chat.id == ADMIN_ID)
@@ -590,6 +647,10 @@ def live_system(chat_id, msg_id):
 🚀 SPEED: {ping} ms
 📊 Queue size: {message_queue.qsize()}
 👥 Total Users: {len(seen_users)}
+🧵 Threads: 14 User + 1 Admin
+🚀 Batch Size: {BATCH_SIZE}
+💿 Cache: {len(user_cache)} users
+⏰ Channel Log Delay: 1 min
 
 🔥 Running...
 """, chat_id, msg_id)
@@ -610,8 +671,17 @@ def stop_live(m):
     live_monitor = False
     bot.send_message(ADMIN_ID, "⛔ Monitoring Stopped")
 
+# ========== RAM OPTIMIZATION ==========
+gc.set_threshold(700, 10, 5)
+
 # ========== MAIN ==========
-print("💀🔥 ULTRA ACK BOT WITH QUEUE + NEW USER DETECTION RUNNING 🔥💀")
-print(f"📊 Queue processor active - No message limit!")
+print("💀🔥 ULTRA MAX POWER BOT WITH 1 MIN CHANNEL LOG DELAY 🔥💀")
+print(f"📊 14 User Threads + 1 Admin Thread")
+print(f"🚀 Batch System: ON (BATCH_SIZE={BATCH_SIZE})")
+print(f"💾 Cache System: ON")
+print(f"🔌 Connection Pool: ON")
+print(f"🎬 Full Animation: ON (9 steps, 0.9 sec)")
+print(f"⏰ Channel Log Delay: 1 MINUTE")
 print(f"👥 Tracking users...")
+
 bot.infinity_polling(skip_pending=True)
