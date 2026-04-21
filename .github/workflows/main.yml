@@ -13,7 +13,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 180   # ✅ 3 hour (180 min)
 
     steps:
       - name: 📥 Checkout
@@ -42,4 +42,4 @@ jobs:
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
         run: |
           echo "🚀 Ultra bot starting..."
-          python bot.py
+          python3 bot.py
